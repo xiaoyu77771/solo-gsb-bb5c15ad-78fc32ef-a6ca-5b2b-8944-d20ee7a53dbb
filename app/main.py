@@ -12,6 +12,9 @@
 - POST /api/v1/flags/{flag_key}/rollback  回滚：将历史版本复制为新当前版本（乐观版本检查）
 - POST /api/v1/flags/{flag_key}/evaluate  判定（按路径中的 flag_key，可指定 config_version）
 - POST /api/v1/flags/{flag_key}/preview-impact  发布前候选配置影响预览（只读，不落版本与快照）
+- POST /api/v1/releases                创建多开关发布批次（复用校验与影响预览，不改动当前配置）
+- POST /api/v1/releases/{release_id}/commit  原子提交批次（事务内再核对全部版本，幂等）
+- GET  /api/v1/releases/{release_id}   查询批次状态、逐开关预览摘要与提交后版本号
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
 - GET  /api/v1/decisions          判定快照审计列表（不透明游标分页 + 组合过滤）
 - GET  /api/v1/decisions/{request_id}     按 request_id 查询单条判定快照
@@ -48,6 +51,8 @@ from app.schemas import (
     PreviewImpactResponse,
     PreviewOutcome,
     PreviewUser,
+    ReleaseCreateRequest,
+    ReleaseResponse,
     RollbackRequest,
 )
 
@@ -422,58 +427,53 @@ def evaluate_by_path(flag_key: str, req: EvaluateRequest, db: Session = Depends(
     return _evaluate(req, db, flag_key)
 
 
-@app.post(
-    "/api/v1/flags/{flag_key}/preview-impact",
-    response_model=PreviewImpactResponse,
-)
-def preview_impact(
-    flag_key: str, req: PreviewImpactRequest, db: Session = Depends(get_db)
-) -> PreviewImpactResponse:
-    """发布前评估候选配置：当前版本与候选配置分别做只读判定并对比。
-
-    - 候选 variants/rules/activation_window 沿用创建接口的全部校验（Pydantic 层返回 422）；
-    - 不写入配置版本，也不写入 DecisionSnapshot；
-    - 两侧判定都应用各自配置的生效窗口（同一请求共用同一判定时刻）；
-    - 仅返回 variant_key / decision_path / matched_rule_index 任一发生变化的用户，
-      顺序与请求一致；汇总输入数、变化数及当前变体 -> 候选变体的迁移计数。
-    """
-    flag = crud.get_flag_or_none(db, flag_key)
-    if flag is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在"
+def _build_candidate_config(
+    body,
+) -> tuple[list[eng.Rule], list[eng.Variant], eng.ActivationWindow | None]:
+    """把候选配置体（variants/rules/activation_window，已通过 Pydantic 校验）
+    构建为引擎对象；候选仅存在于请求内存中。"""
+    candidate_rules = [
+        eng.Rule(**r.model_dump())
+        for r in sorted(body.rules, key=lambda x: x.priority)
+    ]
+    candidate_variants = [eng.Variant(**v.model_dump()) for v in body.variants]
+    candidate_window = (
+        eng.ActivationWindow(
+            inactive_variant_key=body.activation_window.inactive_variant_key,
+            active_from=body.activation_window.active_from,
+            active_until=body.activation_window.active_until,
         )
+        if body.activation_window is not None
+        else None
+    )
+    return candidate_rules, candidate_variants, candidate_window
 
+
+def _impact_preview(
+    flag: FlagConfig,
+    candidate_rules: list[eng.Rule],
+    candidate_variants: list[eng.Variant],
+    candidate_window: eng.ActivationWindow | None,
+    users: list[PreviewUser],
+    now: datetime,
+) -> tuple[list[PreviewChange], dict[str, dict[str, int]]]:
+    """对每个用户分别用当前线上配置与候选配置做只读判定并对比。
+
+    返回 (发生变化的用户列表, 当前变体->候选变体迁移计数)；不写版本、
+    不写快照。两侧判定共用同一判定时刻，保证窗口判定可比。
+    """
     current_rules = crud.parse_rules(flag.rules_json)
     current_variants = crud.parse_variants(flag.variants_json)
     current_window = crud.parse_activation_window(flag.activation_window_json)
 
-    # 候选配置仅存在于请求内存中；RuleIn/VariantIn 与创建接口同结构、同校验
-    candidate_rules = [
-        eng.Rule(**r.model_dump())
-        for r in sorted(req.rules, key=lambda x: x.priority)
-    ]
-    candidate_variants = [eng.Variant(**v.model_dump()) for v in req.variants]
-    candidate_window = (
-        eng.ActivationWindow(
-            inactive_variant_key=req.activation_window.inactive_variant_key,
-            active_from=req.activation_window.active_from,
-            active_until=req.activation_window.active_until,
-        )
-        if req.activation_window is not None
-        else None
-    )
-
-    # 整个请求使用同一时刻判定窗口，保证各用户结果可比
-    now = datetime.now(timezone.utc)
-
     def _decide_with_window(variants, rules, window, user: PreviewUser) -> eng.Decision:
         if window is not None and not eng.window_is_active(window, now):
             return eng.inactive_decision(window, now)
-        return decide(flag_key, user.user_id, user.context, variants, rules)
+        return decide(flag.flag_key, user.user_id, user.context, variants, rules)
 
     changes: list[PreviewChange] = []
     migration: dict[str, dict[str, int]] = {}
-    for user in req.users:
+    for user in users:
         current_decision = _decide_with_window(
             current_variants, current_rules, current_window, user
         )
@@ -511,6 +511,37 @@ def preview_impact(
                 bucket[candidate_outcome.variant_key] = (
                     bucket.get(candidate_outcome.variant_key, 0) + 1
                 )
+    return changes, migration
+
+
+@app.post(
+    "/api/v1/flags/{flag_key}/preview-impact",
+    response_model=PreviewImpactResponse,
+)
+def preview_impact(
+    flag_key: str, req: PreviewImpactRequest, db: Session = Depends(get_db)
+) -> PreviewImpactResponse:
+    """发布前评估候选配置：当前版本与候选配置分别做只读判定并对比。
+
+    - 候选 variants/rules/activation_window 沿用创建接口的全部校验（Pydantic 层返回 422）；
+    - 不写入配置版本，也不写入 DecisionSnapshot；
+    - 两侧判定都应用各自配置的生效窗口（同一请求共用同一判定时刻）；
+    - 仅返回 variant_key / decision_path / matched_rule_index 任一发生变化的用户，
+      顺序与请求一致；汇总输入数、变化数及当前变体 -> 候选变体的迁移计数。
+    """
+    flag = crud.get_flag_or_none(db, flag_key)
+    if flag is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在"
+        )
+
+    candidate_rules, candidate_variants, candidate_window = _build_candidate_config(req)
+
+    # 整个请求使用同一时刻判定窗口，保证各用户结果可比
+    now = datetime.now(timezone.utc)
+    changes, migration = _impact_preview(
+        flag, candidate_rules, candidate_variants, candidate_window, req.users, now
+    )
 
     return PreviewImpactResponse(
         flag_key=flag_key,
@@ -520,6 +551,121 @@ def preview_impact(
         changes=changes,
         migration_counts=migration,
     )
+
+
+@app.post(
+    "/api/v1/releases",
+    response_model=ReleaseResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_release(req: ReleaseCreateRequest, db: Session = Depends(get_db)):
+    """创建多开关发布批次：候选配置仅校验与预览，不改动任何当前配置。
+
+    - 每个候选的 variants/rules/activation_window 与创建接口同结构、同校验
+      （Pydantic 层返回 422）；同一批次内 flag_key 不可重复；
+    - 涉及开关不存在返回 404；expected_version 与创建时刻的线上版本不一致
+      立即返回 409（提交时事务内还会再次核对）；
+    - 逐开关复用单开关影响预览逻辑，仅固化预览摘要到批次，不写配置版本、
+      不写 DecisionSnapshot。
+    """
+    flags: dict[str, FlagConfig] = {}
+    for cand in req.candidates:
+        flag = crud.get_flag_or_none(db, cand.flag_key)
+        if flag is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"开关 {cand.flag_key!r} 不存在",
+            )
+        if flag.version != cand.expected_version:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"开关 {cand.flag_key!r} 当前版本为 {flag.version}，与期望版本 "
+                    f"{cand.expected_version} 不一致"
+                ),
+            )
+        flags[cand.flag_key] = flag
+
+    # 整个批次共用同一判定时刻：与单开关预览一致，各候选结果可比
+    now = datetime.now(timezone.utc)
+    items: list[dict] = []
+    for cand in req.candidates:
+        flag = flags[cand.flag_key]
+        rules_json, variants_json, window_json = crud.serialize_config_body(cand)
+        candidate_rules, candidate_variants, candidate_window = _build_candidate_config(cand)
+        changes, migration = _impact_preview(
+            flag,
+            candidate_rules,
+            candidate_variants,
+            candidate_window,
+            req.users,
+            now,
+        )
+        items.append(
+            {
+                "flag_key": cand.flag_key,
+                "description": cand.description,
+                "expected_version": cand.expected_version,
+                "current_version": flag.version,
+                "rules_json": rules_json,
+                "variants_json": variants_json,
+                "activation_window_json": window_json,
+                "committed_version": None,
+                "preview": {
+                    "total_users": len(req.users),
+                    "changed_users": len(changes),
+                    "changes": [c.model_dump() for c in changes],
+                    "migration_counts": migration,
+                },
+            }
+        )
+
+    release_id = uuid.uuid4().hex
+    batch = crud.create_release(db, release_id=release_id, items=items)
+    return crud.release_to_response(batch)
+
+
+@app.post(
+    "/api/v1/releases/{release_id}/commit",
+    response_model=ReleaseResponse,
+)
+def commit_release(release_id: str, db: Session = Depends(get_db)):
+    """提交批次：单一事务内再核对全部当前版本，全部一致才原子发布。
+
+    - pending 批次：事务内对每个开关执行带版本谓词的条件更新，任一冲突
+      （开关已删除或版本已被推进）整体回滚并返回 409，不存在部分写入；
+    - committed 批次：幂等返回首次提交结果（不会再次核对、再次追加版本）；
+    - 批次不存在返回 404。
+    """
+    batch = crud.get_release(db, release_id)
+    if batch is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"发布批次 {release_id!r} 不存在",
+        )
+    if batch.status == "committed":
+        # 幂等：重复提交直接返回首次提交结果
+        return crud.release_to_response(batch)
+    try:
+        batch = crud.commit_release(db, batch)
+    except crud.VersionConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return crud.release_to_response(batch)
+
+
+@app.get(
+    "/api/v1/releases/{release_id}",
+    response_model=ReleaseResponse,
+)
+def get_release(release_id: str, db: Session = Depends(get_db)):
+    """返回批次状态、逐开关预览摘要；提交后含各开关的新版本号。"""
+    batch = crud.get_release(db, release_id)
+    if batch is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"发布批次 {release_id!r} 不存在",
+        )
+    return crud.release_to_response(batch)
 
 
 @app.get(

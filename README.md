@@ -13,7 +13,8 @@
 - 支持**版本化生效窗口（activation_window）**：按所选配置版本的 `[active_from, active_until)` 判定，窗口外跳过 override、规则与分桶，直接返回兜底变体（`decision_path="inactive"`）；窗口随当前配置与每个历史版本一同保存；
 - 支持**按用户的临时强制变体（override）**：未指定 `config_version` 时优先于规则与分桶，可带过期时间，到期 / 变体被移除后自动失效；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
-- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**。
+- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**；
+- 支持**多开关发布批次**：一次提交多个开关的候选配置并逐开关生成影响预览（不改动当前配置），提交时在单一事务内再核对全部版本，任一冲突整体回滚 `409`、绝不部分写入，重复提交幂等返回首次结果。
 
 ## 一条命令启动
 
@@ -80,6 +81,9 @@ curl -sS -X DELETE http://localhost:8000/api/v1/flags/new_checkout/overrides/use
 | `POST` | `/api/v1/flags/{flag_key}/rollback` | 将指定历史版本复制为新当前版本（乐观版本检查，返回 `201`） |
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
 | `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前候选配置影响预览（只读，不写版本 / 快照） |
+| `POST` | `/api/v1/releases` | 创建多开关发布批次（多个候选 + 预览用户，复用校验与影响预览，不改动当前配置，返回 `201`） |
+| `POST` | `/api/v1/releases/{release_id}/commit` | 原子提交批次（单一事务内再核对全部版本；冲突返回 `409`；重复提交幂等） |
+| `GET` | `/api/v1/releases/{release_id}` | 查询批次状态、逐开关预览摘要与提交后的版本号 |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
 | `GET` | `/api/v1/decisions` | 判定快照审计列表（组合过滤 + 不透明游标分页） |
 | `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询单条判定快照 |
@@ -376,6 +380,110 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/preview-impact \
 - `current_version` 为当前线上版本，预览不会使版本号自增；
 - `migration_counts` 按“当前变体 → 候选变体”汇总迁移人数（仅统计变体发生变化的用户；变体不变、仅判定路径或命中规则变化的用户计入 `changed_users`，但不进入迁移计数）。
 
+### 多开关发布批次（预览 → 原子提交）
+
+需要把**多个开关的候选配置作为一个批次**一起发布时，使用发布批次接口。流程分两步：
+
+1. `POST /api/v1/releases` 创建**待提交批次**：对每个开关复用[创建开关](#创建开关)的全部配置校验与[影响预览](#发布前影响预览只读)逻辑，逐开关生成只读预览摘要。创建批次**不改动任何开关当前配置**，也不写版本与判定快照；
+2. `POST /api/v1/releases/{release_id}/commit` 提交：在**单一数据库事务**内再次核对每个开关的当前版本，**全部一致**才为各开关追加不可变版本并更新当前配置；**任一冲突整体回滚，返回 `409`，不存在部分写入**。
+
+**创建批次**：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "candidates": [
+      {
+        "flag_key": "new_checkout",
+        "description": "批次：结账灰度调到 50/50",
+        "expected_version": 1,
+        "variants": [
+          {"key": "on",  "weight": 50},
+          {"key": "off", "weight": 50}
+        ],
+        "rules": []
+      },
+      {
+        "flag_key": "billing_v2",
+        "description": "批次：账单改版 50/50",
+        "expected_version": 3,
+        "variants": [
+          {"key": "on",  "weight": 50},
+          {"key": "off", "weight": 50}
+        ],
+        "rules": []
+      }
+    ],
+    "users": [
+      {"user_id": "alice", "context": {}},
+      {"user_id": "bob",   "context": {"employee": true}}
+    ]
+  }'
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `candidates` | 至少 1 个开关候选；每个候选即一份完整候选配置（`variants` / `rules` / 可选 `activation_window`）+ `flag_key` / `description` / `expected_version`；同一批次内 `flag_key` 不可重复 |
+| `candidates[].expected_version` | 调用方认为的该开关**当前线上版本**（`>= 1`）；创建时先核对一次，提交时在事务内再核对一次 |
+| `users` | 全批次共享的一批预览用户，1～500 个、`user_id` 互异（与单开关预览一致） |
+
+创建成功返回 `201`，响应为 `pending` 批次，逐开关带预览摘要（结构与单开关 `preview-impact` 的 `total_users` / `changed_users` / `changes` / `migration_counts` 一致）：
+
+```json
+{
+  "release_id": "64c9a82123c14a6fb165fbb5df113ca7",
+  "status": "pending",
+  "items": [
+    {
+      "flag_key": "new_checkout",
+      "description": "批次：结账灰度调到 50/50",
+      "expected_version": 1,
+      "current_version": 1,
+      "variants": [{"key": "on", "weight": 50, "description": ""}, {"key": "off", "weight": 50, "description": ""}],
+      "rules": [],
+      "activation_window": null,
+      "preview": {
+        "total_users": 2,
+        "changed_users": 1,
+        "changes": [
+          {"user_id": "alice", "current": {"variant_key": "off", "decision_path": "bucket", "matched_rule_index": null},
+           "candidate": {"variant_key": "on", "decision_path": "bucket", "matched_rule_index": null}}
+        ],
+        "migration_counts": {"off": {"on": 1}}
+      },
+      "committed_version": null
+    }
+  ],
+  "created_at": "2026-09-18T09:00:00Z",
+  "committed_at": null
+}
+```
+
+**提交批次**：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/releases/64c9a82123c14a6fb165fbb5df113ca7/commit
+```
+
+行为约定：
+
+- 成功返回 `200`，批次 `status="committed"`，每个 item 带回提交后的新版本号 `committed_version`（即 `expected_version + 1`），并补 `committed_at`；各开关当前配置更新为候选内容，版本历史各追加一条**不可变版本**；
+- 提交在**单一数据库事务**内完成：对每个开关执行带版本谓词的条件更新（`UPDATE ... WHERE flag_key=? AND version=expected_version`），任一未命中行（版本已被其他发布推进，或开关已删除）即**整批回滚返回 `409`**，已更新的开关随之撤销，绝不部分写入；`(flag_key, version)` 唯一约束兜底并发提交；
+- **重复提交同一批次幂等**：对已 `committed` 的批次再次提交（或提交后重试）直接返回**首次提交结果**，不会再次核对版本、不会再次追加版本号；
+- `pending` 批次冲突后仍可 `GET` 查询，但其候选绑定的是创建时的版本，期望版本已被推进后继续提交仍会 `409`（需要基于新版本重新创建批次）；
+- 创建批次时开关不存在返回 `404`；`expected_version` 与创建时刻线上版本不一致立即返回 `409`（提前失败，提交时的事务内核对才是最终闸门）；配置不合法（权重和不为 100、规则引用不存在的变体、`flag_key` 重复、预览用户重复或越界等）返回 `422`；批次不存在（提交 / 查询）返回 `404`。
+
+**查询批次**：
+
+```bash
+curl -sS http://localhost:8000/api/v1/releases/64c9a82123c14a6fb165fbb5df113ca7
+```
+
+返回与提交接口相同的结构：批次状态（`pending` / `committed`）、逐开关预览摘要；提交后每个 item 的 `committed_version` 为该开关发布后的新版本号，可再用 `GET /api/v1/flags/{flag_key}/versions/{version}` 核对不可变版本内容。
+
 ### 判定快照审计列表（游标分页）
 
 `GET /api/v1/decisions` 与按 `request_id` 的单条查询并存，用于审计 / 回溯历史判定，支持以下查询参数组合过滤：
@@ -447,10 +555,10 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── engine.py      # 规则判定 + 稳定哈希分桶 + 解释链（纯函数，易测）
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
 │   ├── cursor.py      # 审计列表的不透明签名游标（边界 + 过滤绑定 + 高水位）
-│   ├── crud.py        # 配置、版本、override 与快照持久化（含分页查询与索引补齐）
-│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / flag_overrides / decision_snapshots）
+│   ├── crud.py        # 配置、版本、override、发布批次与快照持久化（含原子提交、分页查询与索引补齐）
+│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / flag_overrides / release_batches / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（120 项，含 override 与生效窗口用例）
+├── tests/             # pytest：引擎单测 + API 集成测试（137 项，含 override、生效窗口与发布批次用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -467,5 +575,6 @@ python -m pytest -q
 
 - 服务定位为**本地 / 单机**使用：SQLite + 单实例，未做多副本一致性；
 - 判定快照只增不删（删除开关不影响历史快照回查）；配置版本与按用户 override 随开关一并删除；
+- 发布批次（`release_batches`）只增不删：`pending` 批次保留创建时的候选与预览摘要，`committed` 批次额外固化各开关提交后的新版本号；删除开关不会删除历史批次记录（其中仅存创建时的配置快照与预览，不影响线上判定）；
 - 快照保存判定时的 `config_version` 与 `decision_path`（含 override 的变体与原因）；幂等重放重建 `matched_rule` 详情时优先取该版本的历史配置，版本记录缺失（如开关被删除重建）时回退到当前版本配置；
 - 本功能上线前已存在的开关，启动时会自动为当前版本补齐一条版本记录；升级到含 override 的版本时，老库会自动给快照表补 `decision_path` 列并回填 `rule` / `bucket`；升级到含生效窗口的版本时，老库会自动给 `flag_configs` / `flag_config_versions` 补 `activation_window_json` 列（老数据为 `NULL`，视为无窗口）。以上迁移均为幂等，重复启动无副作用。

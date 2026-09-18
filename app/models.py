@@ -85,6 +85,35 @@ class FlagOverride(Base):
     )
 
 
+class ReleaseBatch(Base):
+    """多开关发布批次：一次预览、一次原子提交、提交幂等。
+
+    创建（POST /api/v1/releases）时仅落一条 ``pending`` 记录：
+    候选配置与逐开关影响预览固化在 JSON 列中，不改动任何开关当前配置。
+    提交时在单一事务内对每个 flag_key 做
+    ``UPDATE ... WHERE flag_key=? AND version=expected_version`` 的
+    条件更新并追加不可变版本；任一条件更新未命中即回滚整批（409）。
+    同一批次重复提交直接返回首次提交结果（幂等）。
+    """
+
+    __tablename__ = "release_batches"
+
+    release_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True
+    )
+    # pending：已生成预览、尚未提交；committed：已原子发布
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
+    # 逐开关候选/预览结果，保持请求顺序：
+    # [{"flag_key","description","expected_version","current_version",
+    #   "rules_json","variants_json","activation_window_json",
+    #   "committed_version"(提交后补),
+    #   "preview": {"total_users","changed_users","changes",
+    #               "migration_counts"}}]
+    items_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class DecisionSnapshot(Base):
     """一次判定请求的完整快照，可按 request_id 回查。"""
 

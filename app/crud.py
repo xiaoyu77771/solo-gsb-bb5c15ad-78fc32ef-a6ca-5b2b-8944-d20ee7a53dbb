@@ -4,13 +4,21 @@ import json
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
-from sqlalchemy import delete, func, inspect, select, text
+from sqlalchemy import delete, func, inspect, select, text, update
 from sqlalchemy.orm import Session
 
 from app import engine as eng
-from app.models import DecisionSnapshot, FlagConfig, FlagConfigVersion, FlagOverride
+from app.models import (
+    DecisionSnapshot,
+    FlagConfig,
+    FlagConfigVersion,
+    FlagOverride,
+    ReleaseBatch,
+    _utcnow,
+)
 from app.schemas import (
     ActivationWindowIn,
+    FlagConfigBody,
     FlagUpsertRequest,
     OverrideUpsertRequest,
     RuleIn,
@@ -28,6 +36,21 @@ class VersionNotFound(Exception):
 
 class VersionConflict(Exception):
     """expected_current_version 与实际当前版本不一致（期望版本已过期）。"""
+
+
+def serialize_config_body(payload: FlagConfigBody) -> tuple[str, str, str | None]:
+    """把候选配置体（variants/rules/activation_window）序列化为存储 JSON。
+
+    创建开关、发布批次提交共用同一份序列化，保证落库形态一致；
+    rules 按 priority 升序存储。
+    """
+    rules_json = json.dumps(
+        [r.model_dump() for r in sorted(payload.rules, key=lambda x: x.priority)],
+        ensure_ascii=False,
+    )
+    variants_json = json.dumps([v.model_dump() for v in payload.variants], ensure_ascii=False)
+    window_json = serialize_activation_window(payload.activation_window)
+    return rules_json, variants_json, window_json
 
 
 def parse_rules(raw: str) -> list[eng.Rule]:
@@ -85,13 +108,7 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
 
     同一事务中向 flag_config_versions 追加一份完整不可变快照。
     """
-    rules_json = json.dumps(
-        [r.model_dump() for r in sorted(payload.rules, key=lambda x: x.priority)],
-        ensure_ascii=False,
-    )
-    variants_json = json.dumps([v.model_dump() for v in payload.variants], ensure_ascii=False)
-    # 整体覆盖语义：未提供 activation_window 即清除已有窗口
-    window_json = serialize_activation_window(payload.activation_window)
+    rules_json, variants_json, window_json = serialize_config_body(payload)
 
     flag = db.scalar(select(FlagConfig).where(FlagConfig.flag_key == payload.flag_key))
     if flag is None:
@@ -510,3 +527,155 @@ def list_snapshots(
         DecisionSnapshot.decided_at.desc(), DecisionSnapshot.request_id.desc()
     ).limit(limit + 1)
     return db.scalars(stmt).all()
+
+
+# ---------------------------------------------------------------------------
+# 多开关发布批次
+# ---------------------------------------------------------------------------
+
+
+def create_release(db: Session, *, release_id: str, items: list[dict]) -> ReleaseBatch:
+    """落一条 pending 批次（items 已含候选配置 JSON 与逐开关预览摘要）。
+
+    仅写 release_batches 一张表，不触碰任何开关当前配置与版本历史。
+    """
+    batch = ReleaseBatch(
+        release_id=release_id,
+        status="pending",
+        items_json=json.dumps(items, ensure_ascii=False),
+    )
+    db.add(batch)
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+def get_release(db: Session, release_id: str) -> ReleaseBatch | None:
+    return db.scalar(select(ReleaseBatch).where(ReleaseBatch.release_id == release_id))
+
+
+def commit_release(db: Session, batch: ReleaseBatch) -> ReleaseBatch:
+    """在**单一数据库事务**内原子提交 pending 批次。
+
+    对每个候选执行带乐观版本谓词的条件更新::
+
+        UPDATE flag_configs
+           SET description=?, rules_json=?, variants_json=?,
+               activation_window_json=?, version=version+1, updated_at=?
+         WHERE flag_key=? AND version=expected_version
+
+    任一更新未命中行（开关已删除，或当前版本已被其他发布推进）即回滚
+    整个事务并抛 VersionConflict——先成功的开关更新随之撤销，不存在
+    部分写入。全部命中后：
+
+    1. 为每个开关追加一条 version=expected_version+1 的不可变版本快照；
+    2. 把提交后的新版本号写回批次 items，批次置为 committed。
+
+    唯一约束 (flag_key, version) 兜底并发：两个事务不可能为同一开关
+    追加同一版本号；冲突时同样整体回滚。
+    """
+    items = json.loads(batch.items_json)
+
+    try:
+        new_versions: dict[str, int] = {}
+        for item in items:
+            expected = item["expected_version"]
+            result = db.execute(
+                update(FlagConfig)
+                .where(
+                    FlagConfig.flag_key == item["flag_key"],
+                    FlagConfig.version == expected,
+                )
+                .values(
+                    description=item["description"],
+                    rules_json=item["rules_json"],
+                    variants_json=item["variants_json"],
+                    activation_window_json=item.get("activation_window_json"),
+                    version=FlagConfig.version + 1,
+                    updated_at=_utcnow(),
+                )
+            )
+            if result.rowcount != 1:
+                # 不立即提交：抛出后由外层 rollback，整批零写入
+                raise VersionConflict(
+                    _release_conflict_message(db, item)
+                )
+            new_versions[item["flag_key"]] = expected + 1
+
+        # 全部条件更新命中后，在同一事务追加不可变版本（只增不改）
+        for item in items:
+            db.add(
+                FlagConfigVersion(
+                    flag_key=item["flag_key"],
+                    version=new_versions[item["flag_key"]],
+                    description=item["description"],
+                    rules_json=item["rules_json"],
+                    variants_json=item["variants_json"],
+                    activation_window_json=item.get("activation_window_json"),
+                )
+            )
+
+        for item in items:
+            item["committed_version"] = new_versions[item["flag_key"]]
+        batch.items_json = json.dumps(items, ensure_ascii=False)
+        batch.status = "committed"
+        batch.committed_at = _utcnow()
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(batch)
+    return batch
+
+
+def _release_conflict_message(db: Session, item: dict) -> str:
+    """构造单个候选核对失败的 409 文案（区分版本推进与开关缺失）。"""
+    flag = get_flag_or_none(db, item["flag_key"])
+    if flag is None:
+        return (
+            f"开关 {item['flag_key']!r} 已不存在（创建批次时期望版本 "
+            f"{item['expected_version']}）"
+        )
+    return (
+        f"开关 {item['flag_key']!r} 当前版本为 {flag.version}，与批次期望版本 "
+        f"{item['expected_version']} 不一致"
+    )
+
+
+def _utc_aware(dt: datetime) -> datetime:
+    """naive UTC（SQLite 读出形态）补回 tzinfo，其余转 UTC。"""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def release_to_response(batch: ReleaseBatch) -> dict:
+    """把批次（含逐开关候选与预览摘要）序列化为响应结构。"""
+    items = json.loads(batch.items_json or "[]")
+    out_items = []
+    for item in items:
+        rules = [RuleIn(**r) for r in json.loads(item["rules_json"])]
+        variants = [VariantIn(**v) for v in json.loads(item["variants_json"])]
+        out_items.append(
+            {
+                "flag_key": item["flag_key"],
+                "description": item["description"],
+                "expected_version": item["expected_version"],
+                "current_version": item["current_version"],
+                "variants": variants,
+                "rules": rules,
+                "activation_window": _activation_window_to_response(
+                    item.get("activation_window_json")
+                ),
+                "preview": item["preview"],
+                "committed_version": item.get("committed_version"),
+            }
+        )
+    return {
+        "release_id": batch.release_id,
+        "status": batch.status,
+        "items": out_items,
+        "created_at": _utc_aware(batch.created_at),
+        "committed_at": _utc_aware(batch.committed_at) if batch.committed_at else None,
+    }

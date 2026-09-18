@@ -308,3 +308,84 @@ class PreviewImpactResponse(BaseModel):
     changes: list[PreviewChange]
     # {"<当前变体>": {"<候选变体>": 迁移人数, ...}, ...}，仅含非零计数
     migration_counts: dict[str, dict[str, int]]
+
+
+class ReleaseCandidate(FlagConfigBody):
+    """发布批次中的单个开关候选（复用 FlagConfigBody 的全部配置校验）。
+
+    flag_key 必须指向已存在的开关；expected_version 为调用方认为的
+    当前线上版本，提交时在事务内再次核对，不一致则整批 409。
+    """
+
+    flag_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    description: str = ""
+    expected_version: int = Field(
+        ge=1,
+        description="调用方认为的当前线上版本；提交事务内再次核对，不一致整批返回 409",
+    )
+
+
+class ReleaseCreateRequest(BaseModel):
+    """创建多开关发布批次：多个开关候选 + 一批共享预览用户。
+
+    仅生成待提交批次与逐开关只读影响预览，不改动任何开关当前配置。
+    flag_key 在同一批次中不允许重复；预览用户 1～500 个且 user_id 互异
+    （与单开关 preview-impact 一致）。
+    """
+
+    candidates: list[ReleaseCandidate] = Field(min_length=1)
+    users: list[PreviewUser] = Field(min_length=1, max_length=500)
+
+    @field_validator("candidates")
+    @classmethod
+    def _flag_keys_unique(cls, v: list[ReleaseCandidate]) -> list[ReleaseCandidate]:
+        keys = [c.flag_key for c in v]
+        if len(set(keys)) != len(keys):
+            raise ValueError("同一发布批次中 flag_key 不允许重复")
+        return v
+
+    @field_validator("users")
+    @classmethod
+    def _user_ids_unique(cls, v: list[PreviewUser]) -> list[PreviewUser]:
+        ids = [u.user_id for u in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("user_id 不允许重复")
+        return v
+
+
+class ReleasePreviewSummary(BaseModel):
+    """批次内单个开关的影响预览摘要（结构与 preview-impact 一致）。"""
+
+    total_users: int
+    changed_users: int
+    changes: list[PreviewChange]
+    migration_counts: dict[str, dict[str, int]]
+
+
+class ReleaseItemResponse(BaseModel):
+    """批次内单个开关的候选配置、预览摘要与提交结果。"""
+
+    flag_key: str
+    description: str
+    expected_version: int = Field(description="创建批次时记录的线上版本（提交时据此核对）")
+    current_version: int = Field(description="创建批次时该开关的线上版本")
+    variants: list[VariantIn]
+    rules: list[RuleIn]
+    activation_window: ActivationWindowIn | None = Field(
+        description="候选配置的生效窗口；null 表示无窗口"
+    )
+    preview: ReleasePreviewSummary
+    committed_version: int | None = Field(
+        default=None,
+        description="提交成功后该开关的新版本号；批次未提交时为 null",
+    )
+
+
+class ReleaseResponse(BaseModel):
+    """发布批次状态与逐开关预览/提交结果（创建、查询、提交共用）。"""
+
+    release_id: str
+    status: Literal["pending", "committed"]
+    items: list[ReleaseItemResponse]
+    created_at: Any
+    committed_at: Any = Field(description="提交完成时间（UTC）；批次未提交时为 null")
