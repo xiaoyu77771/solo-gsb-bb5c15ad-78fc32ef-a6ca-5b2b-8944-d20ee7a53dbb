@@ -308,3 +308,86 @@ class PreviewImpactResponse(BaseModel):
     changes: list[PreviewChange]
     # {"<当前变体>": {"<候选变体>": 迁移人数, ...}, ...}，仅含非零计数
     migration_counts: dict[str, dict[str, int]]
+
+
+# ---------------------------------------------------------------------------
+# 多开关发布批次（POST /api/v1/releases）
+# ---------------------------------------------------------------------------
+
+
+class ReleaseFlagIn(FlagConfigBody):
+    """发布批次内单个开关的候选配置 + 乐观版本检查。
+
+    候选 variants/rules/activation_window 沿用创建接口的全部校验；
+    ``expected_version`` 为调用方认为的当前版本号，批次提交时在事务内
+    再次核对，不一致则整批返回 409、不写入任何版本。
+    """
+
+    flag_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    expected_version: int = Field(
+        ge=1,
+        description="调用方认为的当前版本号；提交时与实际当前版本不一致则整批 409",
+    )
+    description: str = ""
+
+
+class ReleaseCreateRequest(BaseModel):
+    """多开关发布批次创建请求：1～20 个开关候选 + 1～500 个互异预览用户。"""
+
+    flags: list[ReleaseFlagIn] = Field(min_length=1, max_length=20)
+    users: list[PreviewUser] = Field(min_length=1, max_length=500)
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+        description="可选幂等键；相同键 + 相同请求体重放返回首次创建结果",
+    )
+
+    @field_validator("flags")
+    @classmethod
+    def _flag_keys_unique(cls, v: list[ReleaseFlagIn]) -> list[ReleaseFlagIn]:
+        keys = [f.flag_key for f in v]
+        if len(set(keys)) != len(keys):
+            raise ValueError("批次内 flag_key 不允许重复")
+        return v
+
+    @field_validator("users")
+    @classmethod
+    def _user_ids_unique(cls, v: list[PreviewUser]) -> list[PreviewUser]:
+        ids = [u.user_id for u in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("user_id 不允许重复")
+        return v
+
+
+class ReleaseItemSummary(BaseModel):
+    """批次内单个开关的状态与逐开关预览摘要。"""
+
+    flag_key: str
+    expected_version: int = Field(description="创建批次时调用方声明的当前版本号")
+    current_version_at_create: int = Field(
+        description="创建批次时该开关的实际线上版本（预览基线）"
+    )
+    total_users: int = Field(description="该开关评估的预览用户数（批次共用同一批用户）")
+    changed_users: int = Field(description="结果发生变化的用户数")
+    changes: list[PreviewChange]
+    migration_counts: dict[str, dict[str, int]]
+    committed_version: int | None = Field(
+        default=None,
+        description="提交成功后该开关新追加的不可变版本号；pending 时为 null",
+    )
+
+
+class ReleaseResponse(BaseModel):
+    """多开关发布批次状态。"""
+
+    release_id: str
+    status: Literal["pending", "committed"]
+    total_flags: int
+    total_users: int
+    items: list[ReleaseItemSummary]
+    created_at: datetime
+    committed_at: datetime | None = Field(
+        default=None, description="提交时间（UTC）；pending 时为 null"
+    )

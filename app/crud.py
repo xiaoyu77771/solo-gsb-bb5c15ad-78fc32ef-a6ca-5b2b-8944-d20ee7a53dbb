@@ -1,6 +1,7 @@
 """数据读写与配置校验。"""
 
 import json
+import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
@@ -8,11 +9,19 @@ from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.orm import Session
 
 from app import engine as eng
-from app.models import DecisionSnapshot, FlagConfig, FlagConfigVersion, FlagOverride
+from app.models import (
+    DecisionSnapshot,
+    FlagConfig,
+    FlagConfigVersion,
+    FlagOverride,
+    FlagRelease,
+    FlagReleaseItem,
+)
 from app.schemas import (
     ActivationWindowIn,
     FlagUpsertRequest,
     OverrideUpsertRequest,
+    ReleaseFlagIn,
     RuleIn,
     VariantIn,
 )
@@ -28,6 +37,29 @@ class VersionNotFound(Exception):
 
 class VersionConflict(Exception):
     """expected_current_version 与实际当前版本不一致（期望版本已过期）。"""
+
+
+class ReleaseNotFound(Exception):
+    """发布批次不存在。"""
+
+
+def serialize_flag_config(
+    *,
+    rules: Sequence[RuleIn],
+    variants: Sequence[VariantIn],
+    activation_window: ActivationWindowIn | None,
+) -> tuple[str, str, str | None]:
+    """把候选配置序列化为库存 JSON（rules 按 priority 升序固化）。
+
+    创建 / 更新开关与发布批次提交共用同一套序列化，保证两处写入格式一致。
+    """
+    rules_json = json.dumps(
+        [r.model_dump() for r in sorted(rules, key=lambda x: x.priority)],
+        ensure_ascii=False,
+    )
+    variants_json = json.dumps([v.model_dump() for v in variants], ensure_ascii=False)
+    window_json = serialize_activation_window(activation_window)
+    return rules_json, variants_json, window_json
 
 
 def parse_rules(raw: str) -> list[eng.Rule]:
@@ -85,13 +117,11 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
 
     同一事务中向 flag_config_versions 追加一份完整不可变快照。
     """
-    rules_json = json.dumps(
-        [r.model_dump() for r in sorted(payload.rules, key=lambda x: x.priority)],
-        ensure_ascii=False,
+    rules_json, variants_json, window_json = serialize_flag_config(
+        rules=payload.rules,
+        variants=payload.variants,
+        activation_window=payload.activation_window,
     )
-    variants_json = json.dumps([v.model_dump() for v in payload.variants], ensure_ascii=False)
-    # 整体覆盖语义：未提供 activation_window 即清除已有窗口
-    window_json = serialize_activation_window(payload.activation_window)
 
     flag = db.scalar(select(FlagConfig).where(FlagConfig.flag_key == payload.flag_key))
     if flag is None:
@@ -325,6 +355,212 @@ def backfill_missing_versions(db: Session) -> int:
     if added:
         db.commit()
     return added
+
+
+# ---------------------------------------------------------------------------
+# 多开关发布批次
+# ---------------------------------------------------------------------------
+
+
+def _as_utc_aware(dt: datetime | None) -> datetime | None:
+    """SQLite 读出的 naive UTC 统一补回 tzinfo（输出带 Z）。"""
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def get_release(db: Session, release_id: str) -> FlagRelease | None:
+    return db.scalar(select(FlagRelease).where(FlagRelease.release_id == release_id))
+
+
+def get_release_by_idempotency_key(db: Session, key: str | None) -> FlagRelease | None:
+    if not key:
+        return None
+    return db.scalar(select(FlagRelease).where(FlagRelease.idempotency_key == key))
+
+
+def list_release_items(db: Session, release_id: str) -> Sequence[FlagReleaseItem]:
+    return db.scalars(
+        select(FlagReleaseItem)
+        .where(FlagReleaseItem.release_id == release_id)
+        .order_by(FlagReleaseItem.position)
+    ).all()
+
+
+def create_release(
+    db: Session,
+    *,
+    idempotency_key: str | None,
+    fingerprint: str | None,
+    users: list[dict],
+    # 每项：candidate(ReleaseFlagIn)、baseline_version、changes、migration_counts
+    prepared: list[dict],
+) -> tuple[FlagRelease, bool]:
+    """创建 pending 发布批次并固化候选配置与预览摘要（不改动任何开关）。
+
+    版本核对（开关存在且当前版本等于 expected_version）必须由调用方在
+    本函数之前完成；返回 ``(批次, 是否新建)``——幂等键命中已有批次时
+    返回 ``False``，调用方按首次创建结果重放。
+    """
+    if idempotency_key is not None:
+        existing = get_release_by_idempotency_key(db, idempotency_key)
+        if existing is not None:
+            return existing, False
+
+    release = FlagRelease(
+        release_id=uuid.uuid4().hex,
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint,
+        status="pending",
+        users_json=json.dumps(users, ensure_ascii=False, sort_keys=True),
+        total_flags=len(prepared),
+        total_users=len(users),
+    )
+    db.add(release)
+    # 先 flush 拿到 release_id，供子项外键值使用
+    db.flush()
+
+    for position, item in enumerate(prepared):
+        candidate: ReleaseFlagIn = item["candidate"]
+        rules_json, variants_json, window_json = serialize_flag_config(
+            rules=candidate.rules,
+            variants=candidate.variants,
+            activation_window=candidate.activation_window,
+        )
+        db.add(
+            FlagReleaseItem(
+                release_id=release.release_id,
+                position=position,
+                flag_key=candidate.flag_key,
+                expected_version=candidate.expected_version,
+                description=candidate.description,
+                rules_json=rules_json,
+                variants_json=variants_json,
+                activation_window_json=window_json,
+                current_version_at_create=item["baseline_version"],
+                changes_json=json.dumps(
+                    [c.model_dump() for c in item["changes"]], ensure_ascii=False
+                ),
+                migration_counts_json=json.dumps(
+                    item["migration_counts"], ensure_ascii=False
+                ),
+            )
+        )
+    db.commit()
+    db.refresh(release)
+    return release, True
+
+
+def commit_release(db: Session, release_id: str) -> tuple[FlagRelease, list[FlagReleaseItem]]:
+    """在**单一数据库事务**中提交批次。
+
+    步骤（同一事务）：
+    1. 锁定批次行并读取全部子项；
+    2. 按 flag_key 排序后逐行锁定各开关（支持真正行锁的数据库上可串行化
+       并发提交；SQLite 为单写者，锁提示被忽略但语义不变）；
+    3. 事务内**再次核对**每个开关仍存在且当前版本等于 expected_version，
+       任一不满足抛 :class:`VersionConflict`，整事务回滚，不得部分写入；
+    4. 全部一致时为各开关在同一事务中追加不可变版本（version+1）、更新
+       当前配置、回填 committed_version 并把批次翻为 committed。
+
+    已提交批次重复提交直接返回首次结果（幂等），不会再次推进版本。
+    """
+    release = db.scalar(
+        select(FlagRelease)
+        .where(FlagRelease.release_id == release_id)
+        .with_for_update()
+    )
+    if release is None:
+        raise ReleaseNotFound(release_id)
+    if release.status == "committed":
+        db.rollback()
+        return release, list(list_release_items(db, release_id))
+
+    items = list(list_release_items(db, release_id))
+
+    # 行锁按 flag_key 排序获取，避免多批次并发提交时交叉持锁导致死锁
+    flags_by_key: dict[str, FlagConfig] = {}
+    for key in sorted(item.flag_key for item in items):
+        flag = db.scalar(
+            select(FlagConfig).where(FlagConfig.flag_key == key).with_for_update()
+        )
+        if flag is not None:
+            flags_by_key[key] = flag
+
+    # 取锁后再次检查批次状态：并发提交同一批次时，另一侧可能已在本事务
+    # 开始前完成提交（无行锁的 SQLite 依赖事务快照重新读取）
+    if release.status != "pending":
+        db.rollback()
+        return release, list(list_release_items(db, release_id))
+
+    conflicts: list[str] = []
+    for item in items:
+        flag = flags_by_key.get(item.flag_key)
+        if flag is None:
+            conflicts.append(
+                f"开关 {item.flag_key!r} 已不存在（创建批次时处于版本 {item.expected_version}）"
+            )
+        elif flag.version != item.expected_version:
+            conflicts.append(
+                f"开关 {item.flag_key!r} 当前版本为 {flag.version}，与期望版本 "
+                f"{item.expected_version} 不一致"
+            )
+    if conflicts:
+        db.rollback()
+        raise VersionConflict("发布批次版本冲突，未写入任何配置：" + "；".join(conflicts))
+
+    committed_at = datetime.now(timezone.utc)
+    for item in items:
+        flag = flags_by_key[item.flag_key]
+        flag.description = item.description
+        flag.rules_json = item.rules_json
+        flag.variants_json = item.variants_json
+        flag.activation_window_json = item.activation_window_json
+        flag.version += 1
+        item.committed_version = flag.version
+        db.add(
+            FlagConfigVersion(
+                flag_key=flag.flag_key,
+                version=flag.version,
+                description=item.description,
+                rules_json=item.rules_json,
+                variants_json=item.variants_json,
+                activation_window_json=item.activation_window_json,
+            )
+        )
+
+    release.status = "committed"
+    release.committed_at = committed_at
+    db.commit()
+    db.refresh(release)
+    return release, items
+
+
+def release_to_response(
+    release: FlagRelease, items: Sequence[FlagReleaseItem]
+) -> dict:
+    """把批次行与子项行组装为 ReleaseResponse。"""
+    return {
+        "release_id": release.release_id,
+        "status": release.status,
+        "total_flags": release.total_flags,
+        "total_users": release.total_users,
+        "created_at": _as_utc_aware(release.created_at),
+        "committed_at": _as_utc_aware(release.committed_at),
+        "items": [
+            {
+                "flag_key": item.flag_key,
+                "expected_version": item.expected_version,
+                "current_version_at_create": item.current_version_at_create,
+                "total_users": release.total_users,
+                "changed_users": len(json.loads(item.changes_json)),
+                "changes": json.loads(item.changes_json),
+                "migration_counts": json.loads(item.migration_counts_json),
+                "committed_version": item.committed_version,
+            }
+            for item in items
+        ],
+    }
 
 
 def flag_to_response(flag: FlagConfig) -> dict:

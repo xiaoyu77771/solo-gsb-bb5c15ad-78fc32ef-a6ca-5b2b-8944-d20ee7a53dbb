@@ -13,7 +13,8 @@
 - 支持**版本化生效窗口（activation_window）**：按所选配置版本的 `[active_from, active_until)` 判定，窗口外跳过 override、规则与分桶，直接返回兜底变体（`decision_path="inactive"`）；窗口随当前配置与每个历史版本一同保存；
 - 支持**按用户的临时强制变体（override）**：未指定 `config_version` 时优先于规则与分桶，可带过期时间，到期 / 变体被移除后自动失效；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
-- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**。
+- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**；
+- 支持**多开关发布批次**：一次提交多个开关候选与共用预览用户生成待提交批次（含逐开关影响预览），确认后在单一事务中再次核对各自版本并原子发布，任一冲突整体 `409`、不部分写入，重复提交幂等。
 
 ## 一条命令启动
 
@@ -80,6 +81,9 @@ curl -sS -X DELETE http://localhost:8000/api/v1/flags/new_checkout/overrides/use
 | `POST` | `/api/v1/flags/{flag_key}/rollback` | 将指定历史版本复制为新当前版本（乐观版本检查，返回 `201`） |
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
 | `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前候选配置影响预览（只读，不写版本 / 快照） |
+| `POST` | `/api/v1/releases` | 创建多开关发布批次（多候选配置 + 共用预览用户 + 各自 `expected_version`，只生成待提交批次） |
+| `POST` | `/api/v1/releases/{release_id}/commit` | 提交批次（单事务再核版本、原子发布，任一冲突 `409` 不部分写入；重复提交幂等） |
+| `GET` | `/api/v1/releases/{release_id}` | 查询批次状态、逐开关预览摘要与提交后的版本号 |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
 | `GET` | `/api/v1/decisions` | 判定快照审计列表（组合过滤 + 不透明游标分页） |
 | `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询单条判定快照 |
@@ -376,6 +380,101 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/preview-impact \
 - `current_version` 为当前线上版本，预览不会使版本号自增；
 - `migration_counts` 按“当前变体 → 候选变体”汇总迁移人数（仅统计变体发生变化的用户；变体不变、仅判定路径或命中规则变化的用户计入 `changed_users`，但不进入迁移计数）。
 
+### 多开关发布批次（预览 + 乐观并发 + 原子提交）
+
+需要把**多个开关**作为一个批次一起发布时，使用 `POST /api/v1/releases` 分两步完成：先创建**待提交批次**（只做校验与影响预览，不改动当前配置），确认无误后再 `commit` 在**单一数据库事务**中原子发布。
+
+**第一步：创建批次**。请求体包含 1～20 个开关候选（`flags`，批次内 `flag_key` 不可重复）与 1～500 个互异预览用户（`users`，批次内各开关共用同一批用户）。每个候选除 `variants` / `rules` / 可选 `activation_window` / `description` 外，还必须带各自的 `expected_version`（调用方认为的当前版本号）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "idempotency_key": "checkout-release-2026-09-18",
+    "flags": [
+      {
+        "flag_key": "new_checkout",
+        "expected_version": 1,
+        "description": "新版结账页全量",
+        "variants": [
+          {"key": "on",  "weight": 100},
+          {"key": "off", "weight": 0}
+        ],
+        "rules": []
+      },
+      {
+        "flag_key": "pay_promo",
+        "expected_version": 3,
+        "variants": [
+          {"key": "show", "weight": 20},
+          {"key": "hide", "weight": 80}
+        ],
+        "rules": [
+          {"priority": 1, "attribute": "region", "operator": "in",
+           "values": ["cn", "sg"], "variant_key": "show"}
+        ]
+      }
+    ],
+    "users": [
+      {"user_id": "user-1001", "context": {"region": "us"}},
+      {"user_id": "user-1002", "context": {"region": "cn"}}
+    ]
+  }'
+```
+
+创建行为约定：
+
+- 候选配置与[创建开关](#创建开关)**同结构、同校验**（权重和为 100、`priority` 唯一、规则与窗口兜底变体必须存在），不满足返回 `422`；`flags` 为空 / 超 20 个、批次内 `flag_key` 重复、`users` 为空 / 超 500 / `user_id` 重复同样返回 `422`；
+- 创建时逐开关核对：开关不存在返回 `404`；当前版本与 `expected_version` 不一致返回 `409`，两种情况都**不创建批次**；
+- 复用[发布前影响预览](#发布前影响预览只读)的同源只读判定生成**逐开关**预览摘要（`changes` / `migration_counts`，语义与单开关预览完全一致），**不改动任何当前配置、不追加不可变版本、不写判定快照**，批次状态为 `pending`；
+- 成功返回 `201`，响应中每个 `items[]` 含 `expected_version`、创建时的实际线上版本 `current_version_at_create`、预览摘要；此时 `committed_version` 为 `null`。
+
+响应示例（节选）：
+
+```json
+{
+  "release_id": "0c13bc0ca476442094955c973ef74ed6",
+  "status": "pending",
+  "total_flags": 2,
+  "total_users": 2,
+  "committed_at": null,
+  "items": [
+    {
+      "flag_key": "new_checkout",
+      "expected_version": 1,
+      "current_version_at_create": 1,
+      "total_users": 2,
+      "changed_users": 2,
+      "changes": [
+        {"user_id": "user-1001",
+         "current":   {"variant_key": "off", "decision_path": "bucket", "matched_rule_index": null},
+         "candidate": {"variant_key": "on",  "decision_path": "bucket", "matched_rule_index": null}}
+      ],
+      "migration_counts": {"off": {"on": 2}},
+      "committed_version": null
+    }
+  ]
+}
+```
+
+**第二步：提交批次**。在**单一数据库事务**中再次核对全部开关的当前版本，全部一致才为每个开关追加不可变版本（各自 `version+1`）并更新当前配置，批次翻为 `committed`：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/releases/0c13bc0ca476442094955c973ef74ed6/commit
+```
+
+- 任一开关在创建后被其他发布推进（当前版本 ≠ `expected_version`）或已被删除，整体返回 **`409 Conflict`，事务回滚、不得部分写入**（不会有任何开关追加版本），`detail` 会列出全部冲突开关；批次保持 `pending`，待调用方按当前版本重新建批次；
+- 成功返回 `200`，批次 `status="committed"`、`committed_at` 有值，各 item 的 `committed_version` 为该开关**提交后新追加的不可变版本号**（如上例 `new_checkout` 为 2、`pay_promo` 为 4）；此后缺省判定立即按新版本执行，历史版本列表中同样能查到这些新版本；
+- 对**同一批次重复提交是幂等的**：已提交则直接返回首次提交结果，不会再次推进版本号；批次不存在返回 `404`。
+
+**查询批次**：`GET /api/v1/releases/{release_id}` 返回批次状态、逐开关预览摘要与提交后的版本号（结构与创建 / 提交响应一致）；批次不存在返回 `404`。
+
+```bash
+curl -sS http://localhost:8000/api/v1/releases/0c13bc0ca476442094955c973ef74ed6
+```
+
+**创建幂等**：创建请求可携带 `idempotency_key`（1～64 个字母数字及 `_.:-`）。相同键 + **相同请求体**的重复创建直接返回首次创建结果（首次 `201`，重放 `200`，`release_id` 不变），适合客户端超时重试；相同键搭配**不同请求体**返回 `409`。不携带时每次创建都是独立的新批次。
+
 ### 判定快照审计列表（游标分页）
 
 `GET /api/v1/decisions` 与按 `request_id` 的单条查询并存，用于审计 / 回溯历史判定，支持以下查询参数组合过滤：
@@ -448,9 +547,9 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
 │   ├── cursor.py      # 审计列表的不透明签名游标（边界 + 过滤绑定 + 高水位）
 │   ├── crud.py        # 配置、版本、override 与快照持久化（含分页查询与索引补齐）
-│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / flag_overrides / decision_snapshots）
+│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / flag_overrides / decision_snapshots / flag_releases / flag_release_items）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（120 项，含 override 与生效窗口用例）
+├── tests/             # pytest：引擎单测 + API 集成测试（含 override、生效窗口与多开关发布批次用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
